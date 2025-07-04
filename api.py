@@ -143,7 +143,7 @@ async def split_pdf(
     
     - **file**: PDF file to split
     - **start_page**: Starting page number (1-indexed)
-    - **end_page**: Ending page number (1-indexed, optional - defaults to last page)
+    - **end_page**: Ending page number (1-indexed, inclusive, optional - defaults to last page)
     """
     
     # Check rate limit
@@ -171,7 +171,13 @@ async def split_pdf(
         output_path = OUTPUT_DIR / output_filename
         
         # Split the PDF
-        split_pdf_by_range(str(input_path), str(output_path), start_page, end_page or 999999)
+        try:
+            split_pdf_by_range(str(input_path), str(output_path), start_page, end_page)
+        except ValueError as e:
+            # Clean up on validation error
+            if input_path.exists():
+                input_path.unlink()
+            raise HTTPException(status_code=400, detail=str(e))
         
         # Track files
         file_tracker[file_id] = {
