@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from typing import Dict, Optional
 import asyncio
 from pathlib import Path
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Request
 from fastapi.responses import FileResponse
@@ -13,7 +14,14 @@ import uvicorn
 
 from splitter import split_pdf_by_range
 
-app = FastAPI(title="PDF Splitter API", version="1.0.0")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Handle startup and shutdown events."""
+    task = asyncio.create_task(periodic_cleanup())
+    yield
+    task.cancel()
+
+app = FastAPI(title="PDF Splitter API", version="1.0.0", lifespan=lifespan)
 
 # Add CORS middleware
 app.add_middleware(
@@ -34,6 +42,7 @@ OUTPUT_DIR = Path("outputs")
 RATE_LIMIT_HOURS = 0.1  # 1 request per 0.5 hours
 FILE_CLEANUP_MINUTES = 10  # Delete files after 10 minutes
 DOWNLOAD_CLEANUP_MINUTES = 5  # Delete files 5 minutes after download
+CLEANUP_INTERVAL_SECONDS = 15  # How often to run the cleanup task
 
 # Create directories
 UPLOAD_DIR.mkdir(exist_ok=True)
@@ -72,32 +81,54 @@ def check_rate_limit(request: Request) -> bool:
     return True
 
 
-def schedule_file_cleanup(file_id: str, delay_minutes: int):
-    """Schedule file cleanup after specified delay."""
-    async def cleanup_task():
-        await asyncio.sleep(delay_minutes * 60)
-        cleanup_files(file_id)
-    
-    # Schedule cleanup
-    asyncio.create_task(cleanup_task())
-
-
 def cleanup_files(file_id: str):
     """Clean up files associated with a file ID."""
-    if file_id in file_tracker:
-        file_info = file_tracker[file_id]
-        
-        # Remove original file
-        if file_info.get("original_path") and os.path.exists(file_info["original_path"]):
-            os.remove(file_info["original_path"])
-        
-        # Remove split file
-        if file_info.get("split_path") and os.path.exists(file_info["split_path"]):
-            os.remove(file_info["split_path"])
-        
-        # Remove from tracker
-        del file_tracker[file_id]
-        print(f"Cleaned up files for {file_id}")
+    file_info = file_tracker.pop(file_id, None)
+    if not file_info:
+        return
+
+    # Remove original file
+    if file_info.get("original_path") and os.path.exists(file_info["original_path"]):
+        os.remove(file_info["original_path"])
+
+    # Remove split file
+    if file_info.get("split_path") and os.path.exists(file_info["split_path"]):
+        os.remove(file_info["split_path"])
+
+    print(f"Cleaned up files for {file_id}")
+
+
+async def periodic_cleanup():
+    """
+    Periodically checks for and cleans up expired files.
+    This runs in the background.
+    """
+    while True:
+        await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
+        now = datetime.now()
+
+        # Create a list of expired file IDs to avoid modifying dict while iterating
+        expired_ids = []
+        for file_id, file_info in file_tracker.items():
+            is_expired = False
+            # Check if downloaded file is expired
+            if file_info.get("downloaded"):
+                download_time = file_info.get("downloaded_at")
+                if download_time and (now - download_time > timedelta(minutes=DOWNLOAD_CLEANUP_MINUTES)):
+                    is_expired = True
+            # Check if non-downloaded file is expired
+            else:
+                creation_time = file_info.get("created_at")
+                if creation_time and (now - creation_time > timedelta(minutes=FILE_CLEANUP_MINUTES)):
+                    is_expired = True
+
+            if is_expired:
+                expired_ids.append(file_id)
+
+        # Clean up all expired files
+        for file_id in expired_ids:
+            print(f"Auto-cleaning expired files for ID: {file_id}")
+            cleanup_files(file_id)
 
 
 @app.post("/split-pdf")
@@ -151,9 +182,6 @@ async def split_pdf(
             "filename": output_filename
         }
         
-        # Schedule cleanup after 10 minutes
-        schedule_file_cleanup(file_id, FILE_CLEANUP_MINUTES)
-        
         return {
             "file_id": file_id,
             "message": "PDF split successfully",
@@ -184,11 +212,10 @@ async def download_pdf(file_id: str):
     if not os.path.exists(split_path):
         raise HTTPException(status_code=404, detail="File not found")
     
-    # Mark as downloaded and schedule cleanup in 5 minutes
+    # Mark as downloaded. The periodic cleanup will handle deletion.
     if not file_info["downloaded"]:
         file_info["downloaded"] = True
         file_info["downloaded_at"] = datetime.now()
-        schedule_file_cleanup(file_id, DOWNLOAD_CLEANUP_MINUTES)
     
     return FileResponse(
         path=split_path,
